@@ -202,7 +202,7 @@ if (new URLSearchParams(window.location.search).get("clear")) {
 	
 	function createSingleSphere(radius, color, seed) {
 		let complexSphere = new THREE.Group();
-		let particlesOuter = createContinentParticles(radius, color, PARTICLE_COUNTS.single, seed);
+		let particlesOuter = createContinentParticles(radius, color, PARTICLE_COUNTS.single, seed, false);
 		complexSphere.add(particlesOuter);
 		return complexSphere;
 	}
@@ -230,7 +230,7 @@ if (new URLSearchParams(window.location.search).get("clear")) {
 	}
 	
 	// BufferGeometry로 전환 (핵심 최적화)
-	function createContinentParticles(size, color, count, seed) {
+	function createContinentParticles(size, color, count, seed, isInner = false) {
 		const positions = [];
 		const velocities = [];
 		
@@ -342,7 +342,105 @@ if (new URLSearchParams(window.location.search).get("clear")) {
 			depthWrite: false
 		});
 		
-		return new THREE.Points(geometry, material);
+		const points = new THREE.Points(geometry, material);
+		points.userData.isInner = isInner; // 내부 구체 표시
+		return points;
+	}
+	
+	// 연결 파티클 생성 (외부에서 내부로 빨려들어가는 효과)
+	function createConnectionParticles(outerRadius, innerRadius, outerColor, innerColor) {
+		const positions = [];
+		const velocities = [];
+		const progress = []; // 각 파티클의 진행도 (0~1)
+		const streamIds = []; // 어느 스트림에 속하는지
+		
+		const streamCount = isMobile ? 8 : 15; // 빨려들어가는 줄기 개수
+		const particlesPerStream = isMobile ? 30 : 60; // 각 줄기당 파티클 수
+		
+		for (let streamId = 0; streamId < streamCount; streamId++) {
+			// 외부 구체의 랜덤한 시작점
+			let theta = Math.random() * Math.PI * 2;
+			let phi = Math.acos(2 * Math.random() - 1);
+			
+			let startX = Math.sin(phi) * Math.cos(theta);
+			let startY = Math.sin(phi) * Math.sin(theta);
+			let startZ = Math.cos(phi);
+			
+			// 내부 구체의 랜덤한 도착점 (다른 각도)
+			theta = Math.random() * Math.PI * 2;
+			phi = Math.acos(2 * Math.random() - 1);
+			
+			let endX = Math.sin(phi) * Math.cos(theta);
+			let endY = Math.sin(phi) * Math.sin(theta);
+			let endZ = Math.cos(phi);
+			
+			// 스트림을 따라 파티클 배치
+			for (let i = 0; i < particlesPerStream; i++) {
+				let t = i / particlesPerStream; // 0~1
+				
+				// 나선형 경로 (더 역동적)
+				let spiralAngle = t * Math.PI * 4; // 2바퀴 회전
+				let spiralRadius = 0.3 * Math.sin(t * Math.PI); // 중간에 부풀어오름
+				
+				// 기본 선형 보간
+				let baseX = startX * outerRadius * (1 - t) + endX * innerRadius * t;
+				let baseY = startY * outerRadius * (1 - t) + endY * innerRadius * t;
+				let baseZ = startZ * outerRadius * (1 - t) + endZ * innerRadius * t;
+				
+				// 나선 오프셋 추가
+				let perpX = -startY;
+				let perpY = startX;
+				let perpZ = 0;
+				let perpLen = Math.sqrt(perpX * perpX + perpY * perpY + perpZ * perpZ);
+				if (perpLen > 0.01) {
+					perpX /= perpLen;
+					perpY /= perpLen;
+					perpZ /= perpLen;
+				}
+				
+				let x = baseX + perpX * spiralRadius * Math.cos(spiralAngle) * outerRadius;
+				let y = baseY + perpY * spiralRadius * Math.cos(spiralAngle) * outerRadius;
+				let z = baseZ + perpZ * spiralRadius * Math.sin(spiralAngle) * outerRadius;
+				
+				positions.push(x, y, z);
+				velocities.push(0, 0, 0);
+				progress.push(t);
+				streamIds.push(streamId);
+			}
+		}
+		
+		const geometry = new THREE.BufferGeometry();
+		geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+		geometry.setAttribute('velocity', new THREE.Float32BufferAttribute(velocities, 3));
+		geometry.setAttribute('progress', new THREE.Float32BufferAttribute(progress, 1));
+		geometry.setAttribute('streamId', new THREE.Float32BufferAttribute(streamIds, 1));
+		
+		// 색상 그라데이션 (외부색 -> 내부색)
+		const colors = [];
+		for (let i = 0; i < progress.length; i++) {
+			let t = progress[i];
+			colors.push(
+				outerColor.r * (1 - t) + innerColor.r * t,
+				outerColor.g * (1 - t) + innerColor.g * t,
+				outerColor.b * (1 - t) + innerColor.b * t
+			);
+		}
+		geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+		
+		const material = new THREE.PointsMaterial({
+			size: 1.5,
+			transparent: true,
+			opacity: 0.6,
+			blending: THREE.AdditiveBlending,
+			depthWrite: false,
+			vertexColors: true // 각 파티클마다 다른 색상
+		});
+		
+		const points = new THREE.Points(geometry, material);
+		points.userData.isConnection = true;
+		points.userData.outerRadius = outerRadius;
+		points.userData.innerRadius = innerRadius;
+		return points;
 	}
 
 	function updateWindowShape(easing = true) {
@@ -402,6 +500,13 @@ if (new URLSearchParams(window.location.search).get("clear")) {
 
 		for (let layerIndex = 0; layerIndex < complexSphere.children.length; layerIndex++) {
 			let particles = complexSphere.children[layerIndex];
+			
+			// 연결 파티클은 다르게 처리
+			if (particles.userData.isConnection) {
+				updateConnectionParticles(particles, elapsedTime);
+				continue;
+			}
+			
 			particles.rotation.y += 0.0005 * (layerIndex % 2 === 0 ? 1 : -1);
 
 			const positions = particles.geometry.attributes.position.array;
@@ -464,6 +569,71 @@ if (new URLSearchParams(window.location.search).get("clear")) {
 			
 			particles.geometry.attributes.position.needsUpdate = true;
 		}
+	}
+	
+	// 연결 파티클 애니메이션 (흐르는 효과)
+	function updateConnectionParticles(particles, elapsedTime) {
+		const positions = particles.geometry.attributes.position.array;
+		const progressAttr = particles.geometry.attributes.progress.array;
+		const streamIds = particles.geometry.attributes.streamId.array;
+		const count = positions.length / 3;
+		
+		const outerRadius = particles.userData.outerRadius;
+		const innerRadius = particles.userData.innerRadius;
+		
+		// 시간에 따라 진행도 업데이트 (흐르는 효과)
+		const flowSpeed = 0.3; // 흐름 속도
+		
+		for (let i = 0; i < count; i++) {
+			const i3 = i * 3;
+			let streamId = streamIds[i];
+			
+			// 각 스트림마다 약간씩 다른 속도와 위상
+			let streamOffset = (streamId * 0.1) % 1.0;
+			let t = (progressAttr[i] + elapsedTime * flowSpeed + streamOffset) % 1.0;
+			
+			// 새로운 시작/끝 점 계산 (원래 경로 유지)
+			let originalT = progressAttr[i];
+			let seed = streamId * 100; // 각 스트림마다 고유한 시드
+			
+			// 시작점 재계산
+			let theta1 = (seed * 0.1) % (Math.PI * 2);
+			let phi1 = Math.acos(2 * ((seed * 0.01) % 1) - 1);
+			let startX = Math.sin(phi1) * Math.cos(theta1);
+			let startY = Math.sin(phi1) * Math.sin(theta1);
+			let startZ = Math.cos(phi1);
+			
+			// 끝점 재계산
+			let theta2 = ((seed + 50) * 0.1) % (Math.PI * 2);
+			let phi2 = Math.acos(2 * (((seed + 50) * 0.01) % 1) - 1);
+			let endX = Math.sin(phi2) * Math.cos(theta2);
+			let endY = Math.sin(phi2) * Math.sin(theta2);
+			let endZ = Math.cos(phi2);
+			
+			// 나선형 경로
+			let spiralAngle = t * Math.PI * 4;
+			let spiralRadius = 0.3 * Math.sin(t * Math.PI);
+			
+			let baseX = startX * outerRadius * (1 - t) + endX * innerRadius * t;
+			let baseY = startY * outerRadius * (1 - t) + endY * innerRadius * t;
+			let baseZ = startZ * outerRadius * (1 - t) + endZ * innerRadius * t;
+			
+			let perpX = -startY;
+			let perpY = startX;
+			let perpZ = 0;
+			let perpLen = Math.sqrt(perpX * perpX + perpY * perpY + perpZ * perpZ);
+			if (perpLen > 0.01) {
+				perpX /= perpLen;
+				perpY /= perpLen;
+				perpZ /= perpLen;
+			}
+			
+			positions[i3] = baseX + perpX * spiralRadius * Math.cos(spiralAngle) * outerRadius;
+			positions[i3 + 1] = baseY + perpY * spiralRadius * Math.cos(spiralAngle) * outerRadius;
+			positions[i3 + 2] = baseZ + perpZ * spiralRadius * Math.sin(spiralAngle) * outerRadius;
+		}
+		
+		particles.geometry.attributes.position.needsUpdate = true;
 	}
 	
 	function resize() {
